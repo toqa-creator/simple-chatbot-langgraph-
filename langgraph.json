@@ -1,6 +1,8 @@
 {
   "graphs": {
-    "simple_calculator": "./main.py:agent"
+    "manager_agent": "./main.py:manager_agent",
+    "simple_calculator": "./main.py:calculator_agent",
+    "time_agent": "./main.py:time_agent"
   },
   "env": "./.env",
   "python_version": "3.11",
