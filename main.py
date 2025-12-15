@@ -65,8 +65,8 @@ def extract_text_from_message(msg: AnyMessage) -> str:
 
 def extract_math_expression(user_text: str) -> str:
     """
-    يطلع المعادلة من أي سؤال (انجليزي/عربي) زي:
-    "احسب 2 + 3 * 4" -> "2 + 3 * 4"
+    It extracts the equation from any question (English/Arabic) like:
+    "Calculate 2 + 3 * 4" -> "2 + 3 * 4""
     """
     if not user_text:
         return ""
@@ -112,7 +112,7 @@ def safe_eval_expr(expr: str) -> float:
         if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
             return float(n.value)
 
-        # Python < 3.8
+        
         if hasattr(ast, "Num") and isinstance(n, ast.Num):
             return float(n.n)
 
