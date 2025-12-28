@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import operator
 import ast
 from datetime import datetime
@@ -24,7 +25,6 @@ api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
     raise ValueError("Please set GOOGLE_API_KEY in your .env file")
 
-
 model = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
     temperature=0,
@@ -35,16 +35,14 @@ model = ChatGoogleGenerativeAI(
 
 def extract_text_from_message(msg: AnyMessage) -> str:
     """
-    Studio sometimes sends messages as dictations or content as list parts.
-    This function outputs the text in any form
+    Studio sometimes sends content as list parts or dict-like messages.
+    This returns the text in any form.
     """
-    # لو msg dict
     if isinstance(msg, dict):
         content = msg.get("content", "")
     else:
         content = getattr(msg, "content", "")
 
-    
     if isinstance(content, list):
         texts = []
         for part in content:
@@ -56,7 +54,6 @@ def extract_text_from_message(msg: AnyMessage) -> str:
                 texts.append(part)
         return " ".join(texts).strip()
 
-    
     if isinstance(content, str):
         return content.strip()
 
@@ -65,17 +62,24 @@ def extract_text_from_message(msg: AnyMessage) -> str:
 
 def extract_math_expression(user_text: str) -> str:
     """
-    It extracts the equation from any question (English/Arabic) like:
-    "Calculate 2 + 3 * 4" -> "2 + 3 * 4""
+    Extracts a math expression from Arabic/English text.
+    Examples:
+      "احسب 2 + 3 * 4" -> "2 + 3 * 4"
+      "2x4 + 1" -> "2*4 + 1"
     """
     if not user_text:
         return ""
 
+    text = user_text
+
     
-    text = user_text.replace("×", "*").replace("x", "*").replace("X", "*")
+    text = text.replace("×", "*")
     text = text.replace("÷", "/")
 
-   
+    
+    text = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", "*", text)
+
+    
     matches = re.findall(r"[0-9\.\+\-\*/\(\)\s]+", text)
     if not matches:
         return ""
@@ -101,7 +105,7 @@ ALLOWED_UNARYOPS = {
 
 def safe_eval_expr(expr: str) -> float:
     """
-   supports + - * / and brackets
+    Supports + - * / and parentheses safely using AST.
     """
     node = ast.parse(expr, mode="eval")
 
@@ -132,11 +136,9 @@ def safe_eval_expr(expr: str) -> float:
 
 
 def format_number(x: float) -> str:
-    
     if abs(x - round(x)) < 1e-12:
         return str(int(round(x)))
     return str(x)
-
 
 
 def get_current_time_and_date() -> str:
@@ -145,23 +147,26 @@ def get_current_time_and_date() -> str:
 
 
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], operator.add]
+    next: str
+    routed_input: str
+
 
 
 def calculator_node(state: AgentState) -> AgentState:
-    last_msg = state["messages"][-1]
-    user_text = extract_text_from_message(last_msg)
+    user_text = (state.get("routed_input") or "").strip()
     expr = extract_math_expression(user_text)
 
     if not expr:
-        return {"messages": [AIMessage(content="Write a clear equation")]}
+        return {"messages": [AIMessage(content="اكتبي معادلة واضحة زي: 2 + 3 * 4")]}
 
     try:
         result = safe_eval_expr(expr)
         return {"messages": [AIMessage(content=format_number(result))]}
     except Exception as e:
-        return {"messages": [AIMessage(content=f" Error in the equation {e}")]}  
+        return {"messages": [AIMessage(content=f"فيه خطأ في المعادلة: {e}")]}  
+
 
 calc_builder = StateGraph(AgentState)
 calc_builder.add_node("calc", calculator_node)
@@ -183,46 +188,64 @@ time_agent = time_builder.compile()
 
 
 
-def route_to_agent(user_input: str) -> str:
-    text = (user_input or "").lower()
-    time_keywords = [
-        "time", "date", "today", "now",
-        "الوقت", "الساعة", "الساعه", "التاريخ", "النهاردة", "النهارده",
-    ]
-    if any(k in text for k in time_keywords):
-        return "time"
-    return "calculator"
-
-
-def router_node(state: AgentState) -> AgentState:
-    return state
-
-
-def decide_next_agent(state: AgentState):
+def supervisor_node(state: AgentState) -> AgentState:
     last_msg = state["messages"][-1]
     user_text = extract_text_from_message(last_msg)
 
-    
-    msg_type = None
-    if isinstance(last_msg, dict):
-        msg_type = last_msg.get("type")
-    else:
-        msg_type = getattr(last_msg, "type", None)
+    system = SystemMessage(content=(
+        "You are a supervisor router for a LangGraph app.\n"
+        "You must choose the best next agent for the user's last message.\n"
+        "Allowed agents: calculator, time.\n\n"
+        "Rules:\n"
+        "- If the user asks about current time/date -> time\n"
+        "- If the user asks to calculate / evaluate an expression -> calculator\n"
+        "- If there is a clear math expression inside the text -> calculator\n\n"
+        "Return ONLY valid JSON in this exact format:\n"
+        "{\"next\":\"calculator\",\"routed_input\":\"...\"}\n"
+        "Where routed_input is the cleaned user message to pass to the chosen agent."
+    ))
+
+    resp = model.invoke([system, HumanMessage(content=user_text)])
+    raw = (resp.content or "").strip()
 
    
-    if msg_type == "human":
-        return route_to_agent(user_text)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        
+        expr = extract_math_expression(user_text)
+        nxt = "calculator" if expr else "time"
+        data = {"next": nxt, "routed_input": user_text}
 
-    return END
+    nxt = data.get("next", "calculator")
+    if nxt not in {"calculator", "time"}:
+        nxt = "calculator"
+
+    routed_input = data.get("routed_input", user_text)
+    if not isinstance(routed_input, str):
+        routed_input = user_text
+
+    return {"next": nxt, "routed_input": routed_input}
+
+
+def decide_next_agent(state: AgentState):
+    return state.get("next", "calculator")
+
 
 
 manager_builder = StateGraph(AgentState)
-manager_builder.add_node("router", router_node)
+
+manager_builder.add_node("supervisor", supervisor_node)
 manager_builder.add_node("calculator", calculator_agent)
 manager_builder.add_node("time", time_agent)
 
-manager_builder.add_edge(START, "router")
-manager_builder.add_conditional_edges("router", decide_next_agent, ["calculator", "time", END])
+manager_builder.add_edge(START, "supervisor")
+
+manager_builder.add_conditional_edges(
+    "supervisor",
+    decide_next_agent,
+    ["calculator", "time"],
+)
 
 manager_builder.add_edge("calculator", END)
 manager_builder.add_edge("time", END)
@@ -232,7 +255,7 @@ manager_agent = manager_builder.compile()
 
 
 def manager_chat_loop() -> None:
-    print("Manager Agent (Calculator + Time/Date via LangGraph)")
+    print("Manager Agent (Supervisor + Calculator + Time/Date via LangGraph)")
     print("Type 'exit' to quit")
     while True:
         user_input = input("You: ")
