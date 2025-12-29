@@ -64,7 +64,7 @@ def extract_math_expression(user_text: str) -> str:
     """
     Extracts a math expression from Arabic/English text.
     Examples:
-      "احسب 2 + 3 * 4" -> "2 + 3 * 4"
+      " calc 2 + 3 * 4" -> "2 + 3 * 4"
       "2x4 + 1" -> "2*4 + 1"
     """
     if not user_text:
@@ -159,13 +159,13 @@ def calculator_node(state: AgentState) -> AgentState:
     expr = extract_math_expression(user_text)
 
     if not expr:
-        return {"messages": [AIMessage(content="اكتبي معادلة واضحة زي: 2 + 3 * 4")]}
+        return {"messages": [AIMessage(content="Write a clear equation like: 2 + 3 * 4")]}
 
     try:
         result = safe_eval_expr(expr)
         return {"messages": [AIMessage(content=format_number(result))]}
     except Exception as e:
-        return {"messages": [AIMessage(content=f"فيه خطأ في المعادلة: {e}")]}  
+        return {"messages": [AIMessage(content=f"There's an error in the equation:{e}")]}  
 
 
 calc_builder = StateGraph(AgentState)
