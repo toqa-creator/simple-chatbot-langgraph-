@@ -2,8 +2,8 @@ import os
 import re
 import json
 import operator
-import ast
 from datetime import datetime
+from typing import Literal
 
 from dotenv import load_dotenv
 from typing_extensions import TypedDict, Annotated
@@ -14,18 +14,26 @@ from langchain_core.messages import (
     SystemMessage,
     HumanMessage,
     AIMessage,
+    ToolMessage,
 )
+from langchain_core.tools import tool
+
 from langgraph.graph import StateGraph, START, END
 
 
 
 load_dotenv()
-
 api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
     raise ValueError("Please set GOOGLE_API_KEY in your .env file")
 
-model = ChatGoogleGenerativeAI(
+router_model = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash-lite",
+    temperature=0,
+    api_key=api_key,
+)
+
+calc_model = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
     temperature=0,
     api_key=api_key,
@@ -33,112 +41,92 @@ model = ChatGoogleGenerativeAI(
 
 
 
-def extract_text_from_message(msg: AnyMessage) -> str:
-    """
-    Studio sometimes sends content as list parts or dict-like messages.
-    This returns the text in any form.
-    """
+@tool
+def add(a: float, b: float) -> float:
+    """Add a and b."""
+    return a + b
+
+
+@tool
+def subtract(a: float, b: float) -> float:
+    """Subtract b from a."""
+    return a - b
+
+
+@tool
+def multiply(a: float, b: float) -> float:
+    """Multiply a and b."""
+    return a * b
+
+
+@tool
+def divide(a: float, b: float) -> float:
+    """Divide a by b. Raises error for division by zero."""
+    if b == 0:
+        raise ValueError("Division by zero is not allowed.")
+    return a / b
+
+
+TOOLS = [add, subtract, multiply, divide]
+TOOLS_BY_NAME = {t.name: t for t in TOOLS}
+calc_model_with_tools = calc_model.bind_tools(TOOLS)
+
+
+
+def get_text(msg) -> str:
+    """Works with BaseMessage objects AND dict messages from Studio."""
     if isinstance(msg, dict):
         content = msg.get("content", "")
     else:
         content = getattr(msg, "content", "")
 
+    if isinstance(content, str):
+        return content.strip()
+
     if isinstance(content, list):
         texts = []
         for part in content:
-            if isinstance(part, dict):
-                t = part.get("text")
-                if t:
-                    texts.append(t)
+            if isinstance(part, dict) and part.get("text"):
+                texts.append(part["text"])
             elif isinstance(part, str):
                 texts.append(part)
         return " ".join(texts).strip()
 
-    if isinstance(content, str):
-        return content.strip()
-
     return ""
 
 
-def extract_math_expression(user_text: str) -> str:
-    """
-    Extracts a math expression from Arabic/English text.
-    Examples:
-      " calc 2 + 3 * 4" -> "2 + 3 * 4"
-      "2x4 + 1" -> "2*4 + 1"
-    """
-    if not user_text:
-        return ""
+def normalize_messages(messages: list) -> list[AnyMessage]:
+    """Convert Studio dict messages into LangChain Message objects."""
+    normalized: list[AnyMessage] = []
 
-    text = user_text
+    for m in messages or []:
+        if isinstance(m, (HumanMessage, AIMessage, ToolMessage, SystemMessage)):
+            normalized.append(m)
+            continue
 
-    
-    text = text.replace("×", "*")
-    text = text.replace("÷", "/")
+        if isinstance(m, dict):
+            t = (m.get("type") or m.get("role") or "").lower()
+            content = m.get("content", "")
 
-    
-    text = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", "*", text)
+            if t in {"human", "user"}:
+                normalized.append(HumanMessage(content=content))
+            elif t in {"ai", "assistant"}:
+                normalized.append(AIMessage(content=content))
+            elif t == "tool":
+                normalized.append(
+                    ToolMessage(
+                        content=str(content),
+                        tool_call_id=m.get("tool_call_id", "") or m.get("id", "")
+                    )
+                )
+            elif t == "system":
+                normalized.append(SystemMessage(content=content))
+            else:
+                normalized.append(HumanMessage(content=str(content)))
+        else:
+            normalized.append(HumanMessage(content=str(m)))
 
-    
-    matches = re.findall(r"[0-9\.\+\-\*/\(\)\s]+", text)
-    if not matches:
-        return ""
-
-    expr = max(matches, key=len).strip()
-    expr = re.sub(r"\s+", " ", expr).strip()
-    return expr
-
-
-
-ALLOWED_BINOPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-}
-
-ALLOWED_UNARYOPS = {
-    ast.UAdd: operator.pos,
-    ast.USub: operator.neg,
-}
-
-
-def safe_eval_expr(expr: str) -> float:
-    """
-    Supports + - * / and parentheses safely using AST.
-    """
-    node = ast.parse(expr, mode="eval")
-
-    def _eval(n):
-        if isinstance(n, ast.Expression):
-            return _eval(n.body)
-
-        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
-            return float(n.value)
-
-        
-        if hasattr(ast, "Num") and isinstance(n, ast.Num):
-            return float(n.n)
-
-        if isinstance(n, ast.BinOp) and type(n.op) in ALLOWED_BINOPS:
-            left = _eval(n.left)
-            right = _eval(n.right)
-            if isinstance(n.op, ast.Div) and right == 0:
-                raise ValueError("Division by zero is not allowed.")
-            return ALLOWED_BINOPS[type(n.op)](left, right)
-
-        if isinstance(n, ast.UnaryOp) and type(n.op) in ALLOWED_UNARYOPS:
-            return ALLOWED_UNARYOPS[type(n.op)](_eval(n.operand))
-
-        raise ValueError("Unsupported expression")
-
-    return _eval(node)
-
-
-def format_number(x: float) -> str:
-    if abs(x - round(x)) < 1e-12:
-        return str(int(round(x)))
-    return str(x)
+    return normalized
 
 
 def get_current_time_and_date() -> str:
@@ -146,41 +134,93 @@ def get_current_time_and_date() -> str:
     return now.strftime("%A, %d %B %Y, %H:%M:%S")
 
 
+def looks_like_time_question(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in [
+        "time", "date", "today", "now",
+        "الوقت", "الساعة", "التاريخ", "النهارده", "الآن", "دلوقتي"
+    ])
 
-class AgentState(TypedDict, total=False):
+
+def looks_like_math(text: str) -> bool:
+    return bool(re.search(r"\d", text)) and bool(re.search(r"[\+\-\*/×÷]", text))
+
+
+
+class CalcState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], operator.add]
-    next: str
-    routed_input: str
 
 
+def calc_llm_call(state: CalcState) -> CalcState:
+    system = SystemMessage(content=(
+        "You are a calculator assistant.\n"
+        "Use ONLY the provided tools (add, subtract, multiply, divide).\n"
+        "Respect operator precedence.\n"
+        "Return a clear final numeric answer only."
+    ))
 
-def calculator_node(state: AgentState) -> AgentState:
-    user_text = (state.get("routed_input") or "").strip()
-    expr = extract_math_expression(user_text)
-
-    if not expr:
-        return {"messages": [AIMessage(content="Write a clear equation like: 2 + 3 * 4")]}
-
-    try:
-        result = safe_eval_expr(expr)
-        return {"messages": [AIMessage(content=format_number(result))]}
-    except Exception as e:
-        return {"messages": [AIMessage(content=f"There's an error in the equation:{e}")]}  
+    msgs = normalize_messages(state.get("messages", []))
+    resp = calc_model_with_tools.invoke([system] + msgs)
+    return {"messages": [resp]}
 
 
-calc_builder = StateGraph(AgentState)
-calc_builder.add_node("calc", calculator_node)
-calc_builder.add_edge(START, "calc")
-calc_builder.add_edge("calc", END)
+def calc_tool_node(state: CalcState) -> CalcState:
+    last = normalize_messages(state.get("messages", []))[-1]
+    tool_msgs: list[ToolMessage] = []
+
+    for call in getattr(last, "tool_calls", []) or []:
+        name = call.get("name")
+        args = call.get("args", {}) or {}
+        tool_fn = TOOLS_BY_NAME.get(name)
+
+        if not tool_fn:
+            tool_msgs.append(ToolMessage(
+                content=f"Unknown tool: {name}",
+                tool_call_id=call.get("id", "")
+            ))
+            continue
+
+        try:
+            obs = tool_fn.invoke(args)
+            tool_msgs.append(ToolMessage(
+                content=str(obs),
+                tool_call_id=call.get("id", "")
+            ))
+        except Exception as e:
+            tool_msgs.append(ToolMessage(
+                content=f"Tool error: {e}",
+                tool_call_id=call.get("id", "")
+            ))
+
+    return {"messages": tool_msgs}
+
+
+def calc_should_continue(state: CalcState) -> str:
+    last = normalize_messages(state.get("messages", []))[-1]
+    if getattr(last, "tool_calls", None) and len(last.tool_calls) > 0:
+        return "tool_node"
+    return END
+
+
+calc_builder = StateGraph(CalcState)
+calc_builder.add_node("llm_call", calc_llm_call)
+calc_builder.add_node("tool_node", calc_tool_node)
+calc_builder.add_edge(START, "llm_call")
+calc_builder.add_conditional_edges("llm_call", calc_should_continue, ["tool_node", END])
+calc_builder.add_edge("tool_node", "llm_call")
 calculator_agent = calc_builder.compile()
 
 
 
-def time_node(state: AgentState) -> AgentState:
+class TimeState(TypedDict, total=False):
+    messages: Annotated[list[AnyMessage], operator.add]
+
+
+def time_node(state: TimeState) -> TimeState:
     return {"messages": [AIMessage(content=get_current_time_and_date())]}
 
 
-time_builder = StateGraph(AgentState)
+time_builder = StateGraph(TimeState)
 time_builder.add_node("time", time_node)
 time_builder.add_edge(START, "time")
 time_builder.add_edge("time", END)
@@ -188,85 +228,79 @@ time_agent = time_builder.compile()
 
 
 
-def supervisor_node(state: AgentState) -> AgentState:
-    last_msg = state["messages"][-1]
-    user_text = extract_text_from_message(last_msg)
+class ManagerState(TypedDict, total=False):
+    messages: Annotated[list[AnyMessage], operator.add]
+    next: str
+    routed_input: str
+
+
+def supervisor_node(state: ManagerState) -> ManagerState:
+    
+    msgs = normalize_messages(state.get("messages", []))
+    if not msgs:
+        return {"next": "calculator", "routed_input": "2+2"}
+
+    last_msg = msgs[-1]
+    user_text = get_text(last_msg)
+
+    
+    if not user_text:
+        raw_last = state.get("messages", [])[-1] if state.get("messages") else {}
+        if isinstance(raw_last, dict):
+            user_text = (raw_last.get("content") or "").strip()
+
+    if not user_text:
+        return {"next": "calculator", "routed_input": "2+2"}
+
+    
+    if looks_like_time_question(user_text) and not looks_like_math(user_text):
+        return {"next": "time", "routed_input": user_text}
+    if looks_like_math(user_text):
+        return {"next": "calculator", "routed_input": user_text}
 
     system = SystemMessage(content=(
         "You are a supervisor router for a LangGraph app.\n"
-        "You must choose the best next agent for the user's last message.\n"
+        "Choose the best next agent for the user's last message.\n"
         "Allowed agents: calculator, time.\n\n"
         "Rules:\n"
-        "- If the user asks about current time/date -> time\n"
-        "- If the user asks to calculate / evaluate an expression -> calculator\n"
-        "- If there is a clear math expression inside the text -> calculator\n\n"
-        "Return ONLY valid JSON in this exact format:\n"
-        "{\"next\":\"calculator\",\"routed_input\":\"...\"}\n"
-        "Where routed_input is the cleaned user message to pass to the chosen agent."
+        "- If user asks about current time/date -> time\n"
+        "- If user asks to calculate/evaluate -> calculator\n\n"
+        "Return ONLY valid JSON exactly like:\n"
+        "{\"next\":\"calculator\",\"routed_input\":\"...\"}"
     ))
 
-    resp = model.invoke([system, HumanMessage(content=user_text)])
+    resp = router_model.invoke([system, HumanMessage(content=user_text)])
     raw = (resp.content or "").strip()
 
-   
     try:
         data = json.loads(raw)
+        nxt = data.get("next", "calculator")
+        routed_input = data.get("routed_input", user_text)
     except Exception:
-        
-        expr = extract_math_expression(user_text)
-        nxt = "calculator" if expr else "time"
-        data = {"next": nxt, "routed_input": user_text}
+        nxt = "calculator"
+        routed_input = user_text
 
-    nxt = data.get("next", "calculator")
     if nxt not in {"calculator", "time"}:
         nxt = "calculator"
-
-    routed_input = data.get("routed_input", user_text)
     if not isinstance(routed_input, str):
         routed_input = user_text
 
     return {"next": nxt, "routed_input": routed_input}
 
 
-def decide_next_agent(state: AgentState):
-    return state.get("next", "calculator")
+def decide_next(state: ManagerState) -> Literal["calculator", "time"]:
+    return "time" if state.get("next") == "time" else "calculator"
 
 
-
-manager_builder = StateGraph(AgentState)
-
+manager_builder = StateGraph(ManagerState)
 manager_builder.add_node("supervisor", supervisor_node)
 manager_builder.add_node("calculator", calculator_agent)
 manager_builder.add_node("time", time_agent)
 
 manager_builder.add_edge(START, "supervisor")
-
-manager_builder.add_conditional_edges(
-    "supervisor",
-    decide_next_agent,
-    ["calculator", "time"],
-)
-
+manager_builder.add_conditional_edges("supervisor", decide_next, ["calculator", "time"])
 manager_builder.add_edge("calculator", END)
 manager_builder.add_edge("time", END)
 
-manager_agent = manager_builder.compile()
 
-
-
-def manager_chat_loop() -> None:
-    print("Manager Agent (Supervisor + Calculator + Time/Date via LangGraph)")
-    print("Type 'exit' to quit")
-    while True:
-        user_input = input("You: ")
-        if user_input.lower() in {"exit", "quit"}:
-            print("Bye")
-            break
-
-        state = manager_agent.invoke({"messages": [HumanMessage(content=user_input)]})
-        ai_messages = [m for m in state["messages"] if getattr(m, "type", None) == "ai"]
-        print("Bot:", ai_messages[-1].content if ai_messages else "(no response)")
-
-
-if __name__ == "__main__":
-    manager_chat_loop()
+graph = manager_builder.compile()

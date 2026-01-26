@@ -1,12 +1,12 @@
 {
-  "graphs": {
-    "manager_agent": "./main.py:manager_agent",
-    "simple_calculator": "./main.py:calculator_agent",
-    "time_agent": "./main.py:time_agent"
-  },
-  "env": "./.env",
-  "python_version": "3.11",
   "dependencies": [
-    "."
-  ]
+    "langgraph",
+    "langchain-core",
+    "langchain-google-genai",
+    "python-dotenv"
+  ],
+  "graphs": {
+    "simple_chatbot": "main:graph"
+  },
+  "env": ".env"
 }
